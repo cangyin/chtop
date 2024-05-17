@@ -1,0 +1,504 @@
+#!/bin/bash
+
+
+RC_FILE=~/.chtoprc
+
+if [[ ! "$LANG$LC_ALL" =~ "UTF-8" ]]; then echo "Please run in UTF-8 locale."; exit 1; fi
+
+function compact_totals() {
+    sed -nre '/^$/n; /^Totals:$/{n;s/^/         /;x;n;s/^/ totals: /;H;n;s/^/         /;H;x;/: 1. /{s/: 1. /: /;s/^   //mg};s/\x1b\[[0-9;]+m//mg;s/.*/\x1b[2m&\x1b[0m/mg;p;d}; p'
+}
+
+function get_stat() {
+    local p=$(pidof -s clickhouse-server || pidof -s clickhouse);
+    [ -z "$p" ] && { echo "No clickhouse process found." >&2; exit 1; }
+    (cd /proc/$p/task/; awk '{print $1"\t"$2"\t"$14"\t"$15"\t"$22}' $(ps H --no-headers -o tid $p | sed 's,$,/stat,') | tr -d '()')
+}
+
+function get_time_ms() { date +%s%3N; }
+
+CLK_TCK=$(getconf CLK_TCK)
+last_stat=$(get_stat) last_ms=$(get_time_ms) now_ms=0
+
+function report_threads_cpu() {
+    ((NO_THREAD_CPU == 1)) && return
+
+    stat=$(get_stat) now_ms=$(get_time_ms)
+    time_delta=$((now_ms-last_ms))
+
+    local file=$(mktemp -u)
+    (echo "$last_stat" | sed 's/^/old\t/'; echo "$stat" | sed 's/^/new\t/') > $file
+    
+    local sql_having_non_zero sql_with_totals
+    ((THREAD_CPU_NON_ZERO == 1)) && sql_having_non_zero="HAVING CPU > 0"
+    ((WITH_TOTALS == 1)) && sql_with_totals="WITH TOTALS"
+
+    clickhouse local --file $file -S "gen String, tid UInt32, name String, utime UInt64, stime UInt64, starttime UInt64" --query "
+    SELECT name AS thread, count() AS count, round(100*sum((new.utime+new.stime)-(old.utime+old.stime))/($time_delta/1000*$CLK_TCK),1) AS CPU
+    FROM (SELECT * FROM table WHERE gen='old') AS old INNER JOIN (SELECT * FROM table WHERE gen='new') AS new USING (tid)
+    GROUP BY name $sql_with_totals
+    $sql_having_non_zero
+    ORDER BY CPU DESC,name ASC
+    " --output-format $FORMAT | sed '/^$/d; s/^Totals:/\L&\E/'
+
+    rm -rf $file $(ls /tmp/clickhouse-local-*/ 2>/dev/null)
+
+    last_stat=$stat last_ms=$now_ms
+}
+
+function report_clickhouse() {
+    local sql_merges_header="
+    WITH (SELECT toString(count()) FROM system.merges) AS current_merges
+    SELECT '\e[1mMerges and Mutations\e[2;3m (Current ' || current_merges || ', ' ||
+        if(failed_merges>0,toString(failed_merges) || '/' || toString(count_merges) || ' failed in past ten minutes',toString(count_merges) || ' in past ten minutes')
+        || ')\e[0m'
+    FROM (SELECT count() AS count_merges,countIf(error!=0) AS failed_merges FROM system.part_log WHERE event_type = 'MergeParts' AND event_time>now()-toIntervalMinute(10))
+    FORMAT TSVRaw;"
+
+    local sql_merges_header_no_log="
+    WITH (SELECT toString(count()) FROM system.merges) AS current_merges
+    SELECT '\e[1mMerges and Mutations\e[2;3m (Current ' || current_merges || ')\e[0m' FORMAT TSVRaw;"
+
+    [ 0 == "$($CHC --query 'EXISTS system.part_log' 2>/dev/null)" ] && sql_merges_header=$sql_merges_header_no_log
+
+    local sql_with_totals
+    ((WITH_TOTALS == 1)) && sql_with_totals="WITH TOTALS"
+
+    local sql_processes_full="
+    SELECT metric,formatReadableSize(value),description FROM system.metrics WHERE metric='MemoryTracking';
+    SELECT
+        query_kind,initial_user,replaceOne(toString(initial_address),'::ffff:','') AS initial_address_,client_name,read_rows,read_bytes,written_rows,written_bytes,total_rows_approx,
+        leftPad(formatReadableSize(memory_usage),10) AS memory_usage_,
+        leftPad(formatReadableSize(peak_memory_usage),10) AS peak_memory_usage_,
+        length(thread_ids) AS threads,
+        splitByRegexp(' and|, ',formatReadableTimeDelta(elapsed))[1] as elapsed_
+    FROM system.processes
+    ORDER BY query_kind ASC,elapsed DESC;"
+
+    local sql_processes_grouped="
+    SELECT metric,formatReadableSize(value),description FROM system.metrics WHERE metric='MemoryTracking';
+    SELECT
+        query_kind,count() AS count,leftPad(formatReadableSize(sum(memory_usage)), 10) AS memory_usage_,
+        groupUniqArray(initial_user) AS initial_users,
+        groupUniqArray(replaceOne(toString(initial_address),'::ffff:','')) AS initial_addresses
+    FROM system.processes
+    GROUP BY query_kind
+    ORDER BY query_kind DESC;"
+
+    local sql_parts="
+    SELECT
+        database,table,count() AS parts,
+        sum(rows) AS sum_rows,
+        leftPad(formatReadableSize(avg(bytes_on_disk) AS avg_part_size_),10) AS avg_part_size,
+        leftPad(formatReadableSize(sum(bytes_on_disk) AS sum_part_size_),10) AS sum_part_size
+    FROM system.parts
+    WHERE active
+    GROUP BY database,table $sql_with_totals
+    ORDER BY parts DESC,table ASC,parts DESC
+    LIMIT $LIMIT_PARTS;"
+
+    local sql_merges_full="
+    $sql_merges_header
+    SELECT database,table,if(is_mutation, 'Mutation', merge_type) AS type,merge_algorithm AS algorithm,
+        leftPad(formatReadableSize(memory_usage),10) AS memory_usage_,
+        round(progress, 4) AS progress,
+        splitByRegexp(' and|, ',formatReadableTimeDelta(elapsed))[1] as elapsed_,
+        splitByRegexp(' and|, ',formatReadableTimeDelta((elapsed / progress) * (1 - progress)))[1] AS eta,
+        rows_read,num_parts AS parts,partition,result_part_name
+    FROM system.merges AS m JOIN (SELECT DISTINCT database,table,partition,partition_id FROM system.parts) AS p USING (database,table,partition_id)
+    ORDER BY elapsed DESC;"
+
+    local sql_merges_grouped="
+    $sql_merges_header
+    SELECT database,table,if(is_mutation, 'Mutation', merge_type) AS type,count() AS count,
+        leftPad(formatReadableSize(sum(memory_usage) AS sum_memory_),10) AS sum_memory,
+        round(max(progress), 4) AS max_progress,
+        splitByRegexp(' and|, ',formatReadableTimeDelta(argMax(elapsed,progress) AS max_progress_elapsed_))[1] as max_progress_elapsed,
+        splitByRegexp(' and|, ',formatReadableTimeDelta((max_progress_elapsed_ / max_progress) * (1 - max_progress)))[1] AS max_progress_eta
+    FROM system.merges
+    GROUP BY database,table,type $sql_with_totals
+    ORDER BY max_progress_elapsed_ DESC;"
+
+    ((GROUPED_PROCESSES == 1)) && sql_processes=$sql_processes_grouped || sql_processes=$sql_processes_full
+    ((GROUPED_MERGES == 1)) && sql_merges=$sql_merges_grouped || sql_merges=$sql_merges_full
+
+    ((NO_PROCESSES == 1)) && sql_processes=''
+    ((NO_PARTS == 1)) && sql_parts=''
+    ((NO_MERGES == 1)) && sql_merges=''
+
+    local sqls="
+    $sql_processes
+    $sql_parts
+    $sql_merges"
+    # echo "$sqls" > chtop.log
+    $CHC -n --query "$sqls" $ECHO --format $FORMAT | compact_totals
+}
+
+function report_mutation_commands() {
+    local sql="
+    SELECT create_time,database,table,command,mutation_id,parts_to_do,is_done,latest_failed_part,latest_fail_reason
+    FROM system.mutations
+    WHERE is_done=0
+    ORDER BY create_time"
+
+    $CHC -n --query "$sql" $ECHO --format $FORMAT
+}
+
+function header() {
+    local loadavg=$(awk '{print "\x1b[34mSystem LoadAvg:\x1b[0m "$1" "$2" "$3"  \x1b[34mThreads:\x1b[0m "$4}' /proc/loadavg)
+    local len=$(echo -n "$loadavg" | remove_color_escapes | wc -c)
+    local now=$(date +'%F %T.%3N')
+    printf '%s%*s' "$loadavg" $((COLUMNS-len)) "$now";
+}
+
+function status() {
+    if [ -z "$STATUS_TIP" ]; then
+        if ((FROZEN == 1)); then
+            cursor_to $LINES 1;
+            echo -ne "Press 'F' to unfreeze ..."
+        fi
+    else
+        cursor_to $LINES 1;
+        echo -ne "$STATUS_TIP";
+    fi
+}
+
+function save_state() {
+    for v in NO_THREAD_CPU NO_PROCESSES NO_PARTS WITH_TOTALS GROUPED_PROCESSES GROUPED_MERGES THREAD_CPU_NON_ZERO LIMIT_PARTS;
+    do
+        echo "$v=${!v}"
+    done > "$RC_FILE"
+}
+
+function load_state(){
+    while [ $# != 0 ] ; do
+        if [ "$1" == --rcfile ] && [ -f "$2" ];
+            then RC_FILE=$2
+        fi
+        shift
+    done
+    [ -f "$RC_FILE" ] && source "$RC_FILE"
+    # LIMIT_PARTS should not be empty or zero
+    ((LIMIT_PARTS == 0)) && LIMIT_PARTS=5;
+}
+
+function remove_color_escapes() { sed -re 's|\x1b\[[0-9;]+m||g'; }
+
+function remove_escapes() { sed -re 's|\x1b\[[0-9;]*[A-Za-z]||g'; }
+
+function no_color() { if ((INTERACTIVE == 0 || NO_COLOR == 1)); then remove_color_escapes; else cat; fi; }
+
+# `column' command behavior is inconsistent across linux distros
+function align_columns() {
+    local ifs=$1 ofs=$2
+    local unicodes=${3:-_} wide_unicodes=${4:-—}
+
+    local content=$(cat)
+    local content_countable=$(echo "$content" | remove_escapes | sed "s/[$unicodes]/_/g; s/[$wide_unicodes]/__/g" )
+    # echo "$content_countable" > content_countable.log
+
+    awk -F "$ifs" '
+        FNR==NR {
+            cols=(cols<=NF?NF:cols);
+            for (i=1; i<=NF; i++) { len=length($i); max[i]=(len>max[i]?len:max[i]); fields[FNR,i]=len; }
+        }
+        FNR!=NR {
+            for (i=1; i<=cols; i++) {
+                pad=(i==cols ? "" : sprintf("%*s", max[i]-fields[FNR,i], ""));
+                printf "%s%s%s", $i, pad, (i==cols?RS:"'"$ofs"'")
+            }
+        }
+    ' <(echo -n "$content_countable") <(echo -n "$content")
+}
+
+function length() { echo -ne "$*" | wc -c; }
+
+function show_cursor() { echo -ne '\x1b[?25h'; }
+
+function hide_cursor() { echo -ne '\x1b[?25l'; }
+
+function clear_down() { echo -ne '\x1b[0J'; }
+
+function cursor_up() { ((INTERACTIVE == 1 && BATCH == 0)) && echo -ne "\x1b[$1A"; }
+
+function cursor_back() { ((INTERACTIVE == 1 && BATCH == 0)) && echo -ne "\x1b[$1D"; }
+
+function cursor_to() { ((INTERACTIVE == 1 && BATCH == 0)) && echo -ne "\x1b[$1;$2H"; }
+
+function save_cursor() { ((INTERACTIVE == 1 && BATCH == 0)) && echo -ne "\x1b[s"; }
+
+function restore_cursor() { ((INTERACTIVE == 1 && BATCH == 0)) && echo -ne "\x1b[u"; }
+
+function scroll_up() { ((INTERACTIVE == 1 && BATCH == 0)) && echo -ne "\x1b[$1S"; }
+
+function clear_rest_of_screen {
+    if ((INTERACTIVE == 1 && BATCH == 0)); then
+        sed -re 's|$|\x1b[0K|g; s|\t+|&\x1b[0K|'
+        clear_down
+    else
+        cat
+    fi
+}
+
+function setup_screen() {
+    if ((INTERACTIVE == 1 && BATCH == 0)); then
+        trap "stty echo; $PSCR tput rmcup; echo -n '$(show_cursor)'; exit" INT TERM EXIT
+        stty -echo
+        hide_cursor
+        $PSCR tput smcup
+    fi
+    # In interactive non-batch mode.
+    if [ -n "$PSCR" ] && ((BATCH == 0)); then
+        # Make full screen
+        scroll_up $LINES
+        cursor_up $LINES
+    fi
+}
+
+function read_raw_char() { local timeout=$1 var=$2; read -r -s -N1 -t $timeout $var; }
+
+function on_first_stroke {
+    local char=$1
+    case $char in
+        F) FROZEN=$((! FROZEN));;
+        U) NO_THREAD_CPU=$((! NO_THREAD_CPU));;
+        Q) NO_PROCESSES=$((! NO_PROCESSES));;
+        P) NO_PARTS=$((! NO_PARTS));;
+        M) NO_MERGES=$((! NO_MERGES));;
+        T) WITH_TOTALS=$((! WITH_TOTALS));;
+        C|G)
+            FIRST_STROKE=$char;
+            STATUS_TIP="Expecting second key stroke..."
+            ;;
+        W)
+            save_state
+            STATUS_TIP="Wrote current state to $RC_FILE"
+            ;;
+        q) exit;;
+        *) ;;
+    esac
+}
+
+function on_second_stroke {
+    local char=$1
+    case $char in
+        O) THREAD_CPU_NON_ZERO=$((! THREAD_CPU_NON_ZERO));;
+        Q) GROUPED_PROCESSES=$((! GROUPED_PROCESSES));;
+        M) GROUPED_MERGES=$((! GROUPED_MERGES));;
+        *)
+            STATUS_TIP="Unrecognized key command \`$FIRST_STROKE-$char'"
+            FIRST_STROKE=''
+            return;;
+    esac
+    FIRST_STROKE='' STATUS_TIP=''
+}
+
+function on_stoke {
+    local char=$1
+    if [ -z "$char" ]; then return; fi
+
+    case "$FIRST_STROKE" in
+        '') on_first_stroke "$char";;
+        *) on_second_stroke "$char";;
+    esac
+    LAST_KEY_STROKE_TIME=$(get_time_ms)
+    # Drain input
+    while [ -n "$char" ]; do read_raw_char 0.01 char; done
+}
+
+function update_size() { LINES=$(tput lines) COLUMNS=$(tput cols); }
+
+function update_status() {
+    local now=$(get_time_ms)
+    if ((STATUS_SHOW_UP_TIME == 0)) && [ -n "$STATUS_TIP" ]; then
+        STATUS_SHOW_UP_TIME=$now
+    elif ((STATUS_SHOW_UP_TIME != 0 && now - STATUS_SHOW_UP_TIME > 3000)); then
+        STATUS_SHOW_UP_TIME=0 STATUS_TIP=''
+    fi
+    if ((LAST_KEY_STROKE_TIME != 0 && now - LAST_KEY_STROKE_TIME > 3000)); then
+        LAST_KEY_STROKE_TIME=0 FIRST_STROKE=''
+    fi
+    update_size
+}
+
+TAB=$'\t'
+US=$'\x1f' # Unit Separator
+
+function run() {
+    setup_screen
+
+    ((INTERACTIVE == 1 && BATCH == 0)) && echo; # For the first `cursor_up'.
+
+    local column1 column2 content
+    local i=0
+    while ((i++ < BATCH || BATCH == 0)); do
+        if ((FROZEN == 0 || i == 1)); then
+            header_str=$(header)
+            column2=$(report_clickhouse 2>&1)
+            column1=$(report_threads_cpu 2>&1)
+            mutations=$(report_mutation_commands 2>&1)
+        fi
+        update_status
+
+        # set -x
+        content=$( (
+            echo -ne "$header_str\n"
+
+            paste -d "$US" <(echo -n "$column1") <(echo -n "$column2") | align_columns "$US" ' ' "└─┴─┘│┌┬┐"
+
+            echo -n "$mutations"
+        ) |& no_color | clear_rest_of_screen | head -n $LINES)
+
+        cursor_to 1 1
+
+        echo -n "$content"
+        status
+
+        ((i == BATCH)) && { echo; break; } # Exit early in batch mode
+
+        local char=''
+        read_raw_char $UPDATE_INTERVAL char
+        on_stoke "$char"
+    done
+}
+
+function usage() {
+    local name=$(basename $0)
+    echo "Usage:  $(basename $name)  [options]..."
+    sed -n '/^# ARGUMENT SEGMENT BEGIN/,/^# ARGUMENT SEGMENT END/p' $0 | sed -re '/^#/d; /^        [^#]/d' | awk -F'#' '{printf "%-21s%s\n",$1,$2}'
+    echo
+    echo "   Press 'W' in interactive mode to save the state."
+    echo
+    echo "Note: options with no short names should be placed after --, for example:"
+    echo "      $name -b1  --  --cpu-non-zero --limit-parts 5"
+    echo
+}
+
+function check_command() {
+    if [ ! $(command -v "$1") ]; then
+        echo "Command \`$1' not found."
+        exit 127
+    fi
+}
+check_command clickhouse
+
+getopt -T;
+if [ $? == 4 ]; then
+    params=$(getopt \
+        -o hn::Cpf:b:EFUQPMT \
+        -l help,interval:,no-color,preserve-screen,format,batch,echo,freeze,no-cpu,no-processes,no-parts,no-merges,without-totals \
+        --name "$0" -- "$@")
+    [ $? != 0 ] && exit;
+    # Convert to array and remove '--'
+    eval set -- "${params}"
+    params=()
+    while [ $# != 0 ] ; do [ "$1" != '--' ] && params+=("$1"); shift; done
+    set -- "${params[@]}"
+fi
+
+[ -t 0 ] && [ -t 1 ]; [ $? == 1 ]; INTERACTIVE=$?
+# INTERACTIVE=1
+
+CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-9000}
+UPDATE_INTERVAL=2
+FORMAT=PrettyCompactMonoBlock
+LIMIT_PARTS=5
+WITH_TOTALS=1
+GROUPED_PROCESSES=1
+GROUPED_MERGES=1
+
+load_state "$@"
+
+while [ $# != 0 ] ; do case $1 in
+# ARGUMENT SEGMENT BEGIN
+    -h | --help) # This help text.
+        usage; exit 0
+        ;;
+    --port) # ClickHouse client port
+        CLICKHOUSE_PORT=$2;
+        if [[ "$2" =~ [1-9][0-9]+ ]]; then CLICKHOUSE_PORT=$2; else echo "Expected postive integer for --port, got $2"; fi
+        shift 2
+        ;;
+    -n | --interval) # Interactive update interval.
+        UPDATE_INTERVAL=$2; shift 2
+        ((UPDATE_INTERVAL <= 0)) && UPDATE_INTERVAL=0.1
+        ;;
+    -C | --no-color) # No ANSI color and styles on text.
+        NO_COLOR=1; shift
+        ;;
+    -p | --preserve-screen) # Preserve last screen content on exit.
+        PSCR=': '; shift
+        ;;
+    -f | --format) # ClickHouse output format.
+        # Changing formats to other than PrettyCompact* is not recommended.
+        FORMAT=$2; shift 2
+        ;;
+    -b | --batch) # Batch mode. Zero means infinite loop.
+        PSCR=': ' BATCH=$2; shift 2
+        ;;
+    -E | --echo) # In batch mode, print query before execution.
+        # Should be specified after --batch.
+        if ((BATCH != 0)); then ECHO='--echo'; else echo "Option --echo should be specified after --batch."; fi
+        shift
+        ;;
+    -F | --freeze) # Freeze on first update.
+        # Or press 'F' in interactive mode to toggle frozen state.
+        FROZEN=1; shift
+        ;;
+    -U | --no-cpu) # No threads CPU report.
+        # Or press 'U' in interactive mode.
+        NO_THREAD_CPU=1; shift
+        ;;
+    -Q | --no-processes) # No queries report
+        # Or press 'Q' in interactive mode.
+        NO_PROCESSES=1; shift
+        ;;
+    -P | --no-parts) # No parts report
+        # Or press 'P' in interactive mode.
+        NO_PARTS=1; shift
+        ;;
+    -M | --no-merges) # No merges/mutations report. Mutation commands are still reported.
+        # Or press 'M' in interactive mode.
+        NO_MERGES=1; shift
+        ;;
+    -T | --without-totals) # Report without totals.
+        # Or press 'T' in interactive mode.
+        WITH_TOTALS=0; shift
+        ;;
+    --grouped-processes) # Group by query_kind in queries report.
+        # Or press 'GQ' ('G' follwed by 'Q') in interactive mode.
+        GROUPED_PROCESSES=1; shift
+        ;;
+    --grouped-merges) # Group by database,table,kind in merges/mutations report.
+        # Or press 'GM' ('G' follwed by 'M') in interactive mode.
+        GROUPED_MERGES=1; shift
+        ;;
+    --cpu-non-zero) # Only show threads with non zero CPU usage in threads CPU report.
+        # Or press 'CO' ('C' follwed by 'O') in interactive mode.
+        THREAD_CPU_NON_ZERO=1; shift
+        ;;
+    --limit-parts) # Limit number of rows in parts report.
+        if [[ "$2" =~ [1-9][0-9]* ]]; then LIMIT_PARTS=$2; else "Expect postive integer for --limit-parts, got $2"; fi
+        shift 2
+        ;;
+# ARGUMENT SEGMENT END
+    --) shift;
+        ;;
+    *)
+        usage; exit 0
+        ;;
+esac; done
+
+CHC="clickhouse client --log_queries=0 --port $CLICKHOUSE_PORT"
+
+if ((NO_THREAD_CPU == 0)) && [[ -z "$last_stat" ]]; then
+    echo "Can not retrieve threads CPU statistics for ClickHouse."
+    exit 1
+fi
+
+if ! $CHC --query "SELECT 1 FORMAT Null"; then
+    echo "Can not connect to ClickHouse."
+    exit 1
+fi
+
+run
