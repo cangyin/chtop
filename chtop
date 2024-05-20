@@ -385,7 +385,7 @@ check_command clickhouse
 getopt -T;
 if [ $? == 4 ]; then
     params=$(getopt \
-        -o hn::Cpf:b:EFUQPMT \
+        -o hn:Cpf:b:EFUQPMT \
         -l help,interval:,no-color,preserve-screen,format,batch,echo,freeze,no-cpu,no-processes,no-parts,no-merges,without-totals \
         --name "$0" -- "$@")
     [ $? != 0 ] && exit;
