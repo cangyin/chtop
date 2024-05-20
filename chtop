@@ -327,15 +327,15 @@ US=$'\x1f' # Unit Separator
 function run() {
     setup_screen
 
-    ((INTERACTIVE == 1 && BATCH == 0)) && echo; # For the first `cursor_up'.
-
+    local tmpfile_report_threads_cpu=$(mktemp)
     local column1 column2 content
     local i=0
     while ((i++ < BATCH || BATCH == 0)); do
         if ((FROZEN == 0 || i == 1)); then
             header_str=$(header)
             column2=$(report_clickhouse 2>&1)
-            column1=$(report_threads_cpu 2>&1)
+            report_threads_cpu > $tmpfile_report_threads_cpu 2>&1;
+            column1=$(cat $tmpfile_report_threads_cpu; rm -f $tmpfile_report_threads_cpu)
             mutations=$(report_mutation_commands 2>&1)
         fi
         update_status
