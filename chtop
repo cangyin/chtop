@@ -30,15 +30,16 @@ function report_threads_cpu() {
     (echo "$last_stat" | sed 's/^/old\t/'; echo "$stat" | sed 's/^/new\t/') > $file
     
     local sql_having_non_zero sql_with_totals
-    ((THREAD_CPU_NON_ZERO == 1)) && sql_having_non_zero="HAVING CPU > 0"
+    ((THREAD_CPU_NON_ZERO == 1)) && sql_having_non_zero="HAVING cpu > 0"
     ((WITH_TOTALS == 1)) && sql_with_totals="WITH TOTALS"
 
     clickhouse local --file $file -S "gen String, tid UInt32, name String, utime UInt64, stime UInt64, starttime UInt64" --query "
-    SELECT name AS thread, count() AS count, round(100*sum((new.utime+new.stime)-(old.utime+old.stime))/($time_delta/1000*$CLK_TCK),1) AS CPU
+    WITH round(100*sum((new.utime+new.stime)-(old.utime+old.stime))/($time_delta/1000*$CLK_TCK),1) AS cpu
+    SELECT name AS thread, count() AS count, leftPad(toString(cpu),5) AS CPU
     FROM (SELECT * FROM table WHERE gen='old') AS old INNER JOIN (SELECT * FROM table WHERE gen='new') AS new USING (tid)
     GROUP BY name $sql_with_totals
     $sql_having_non_zero
-    ORDER BY CPU DESC,name ASC
+    ORDER BY cpu DESC,name ASC
     " --output-format $FORMAT | sed '/^$/d; s/^Totals:/\L&\E/'
 
     rm -rf $file $(ls /tmp/clickhouse-local-*/ 2>/dev/null)
@@ -478,7 +479,7 @@ while [ $# != 0 ] ; do case $1 in
         THREAD_CPU_NON_ZERO=1; shift
         ;;
     --limit-parts) # Limit number of rows in parts report.
-        if [[ "$2" =~ [1-9][0-9]* ]]; then LIMIT_PARTS=$2; else "Expect postive integer for --limit-parts, got $2"; fi
+        if [[ "$2" =~ [1-9][0-9]* ]]; then LIMIT_PARTS=$2; else echo "Expect postive integer for --limit-parts, got $2"; fi
         shift 2
         ;;
 # ARGUMENT SEGMENT END
