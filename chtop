@@ -1,6 +1,5 @@
 #!/bin/bash
 
-
 RC_FILE=~/.chtoprc
 
 if [[ ! "$LANG$LC_ALL" =~ "UTF-8" ]]; then echo "Please run in UTF-8 locale."; exit 1; fi
@@ -15,6 +14,8 @@ function get_stat() {
     (cd /proc/$p/task/; awk '{print $1"\t"$2"\t"$14"\t"$15"\t"$22}' $(ps H --no-headers -o tid $p | sed 's,$,/stat,') | tr -d '()')
 }
 
+function mktmp() { mktemp -p /tmp -t chtop_tmp_XXXXXXXX; }
+
 function get_time_ms() { date +%s%3N; }
 
 CLK_TCK=$(getconf CLK_TCK)
@@ -26,7 +27,7 @@ function report_threads_cpu() {
     stat=$(get_stat) now_ms=$(get_time_ms)
     time_delta=$((now_ms-last_ms))
 
-    local file=$(mktemp -u)
+    local file=$(mktmp)
     (echo "$last_stat" | sed 's/^/old\t/'; echo "$stat" | sed 's/^/new\t/') > $file
     
     local sql_having_non_zero sql_with_totals
@@ -35,7 +36,7 @@ function report_threads_cpu() {
 
     clickhouse local --file $file -S "gen String, tid UInt32, name String, utime UInt64, stime UInt64, starttime UInt64" --query "
     WITH round(100*sum((new.utime+new.stime)-(old.utime+old.stime))/($time_delta/1000*$CLK_TCK),1) AS cpu
-    SELECT name AS thread, count() AS count, leftPad(toString(cpu),5) AS CPU
+    SELECT name AS thread, count() AS count, toString(cpu) AS CPU
     FROM (SELECT * FROM table WHERE gen='old') AS old INNER JOIN (SELECT * FROM table WHERE gen='new') AS new USING (tid)
     GROUP BY name $sql_with_totals
     $sql_having_non_zero
@@ -243,15 +244,17 @@ function clear_rest_of_screen {
 
 function setup_screen() {
     if ((INTERACTIVE == 1 && BATCH == 0)); then
-        trap "stty echo; $PSCR tput rmcup; echo -n '$(show_cursor)'; exit" INT TERM EXIT
+        trap "stty echo; $PSCR tput rmcup; echo -n '$(show_cursor)'; rm -f /tmp/chtop_tmp_????????; exit" INT TERM EXIT
         stty -echo
         hide_cursor
         $PSCR tput smcup
+    else
+        trap "rm -f /tmp/chtop_tmp_????????; exit" INT TERM EXIT
     fi
     # In interactive non-batch mode.
     if [ -n "$PSCR" ] && ((BATCH == 0)); then
         # Make full screen
-        scroll_up $LINES
+        for _ in $(seq $LINES); do echo; done
         cursor_up $LINES
     fi
 }
@@ -328,24 +331,26 @@ US=$'\x1f' # Unit Separator
 function run() {
     setup_screen
 
-    local tmpfile_report_threads_cpu=$(mktemp)
+    local column1=$(mktmp) column2=$(mktmp)
     local column1 column2 content
     local i=0
     while ((i++ < BATCH || BATCH == 0)); do
         if ((FROZEN == 0 || i == 1)); then
             header_str=$(header)
-            column2=$(report_clickhouse 2>&1)
-            report_threads_cpu > $tmpfile_report_threads_cpu 2>&1;
-            column1=$(cat $tmpfile_report_threads_cpu; rm -f $tmpfile_report_threads_cpu)
+
+            report_clickhouse >$column2 2>&1
+            report_threads_cpu >$column1 2>&1;
+
             mutations=$(report_mutation_commands 2>&1)
         fi
+
         update_status
 
-        # set -x
+        # Using process substitution like `paste <(echo 1) <(echo 2)` leaves zombie processes
         content=$( (
             echo -ne "$header_str\n"
 
-            paste -d "$US" <(echo -n "$column1") <(echo -n "$column2") | align_columns "$US" ' ' "└─┴─┘│┌┬┐"
+            paste -d "$US" $column1 $column2 | align_columns "$US" ' ' "└─┴─┘│┌┬┐"
 
             echo -n "$mutations"
         ) |& no_color | clear_rest_of_screen | head -n $LINES)
