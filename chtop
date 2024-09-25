@@ -67,7 +67,7 @@ function report_clickhouse() {
     ((WITH_TOTALS == 1)) && sql_with_totals="WITH TOTALS"
 
     local sql_processes_full="
-    SELECT metric,formatReadableSize(value),description FROM system.metrics WHERE metric='MemoryTracking';
+    SELECT metric,formatReadableSize(value),description FROM system.metrics WHERE metric IN ('MemoryTracking','MergesMutationsMemoryTracking');
     SELECT
         query_kind,initial_user,replaceOne(toString(initial_address),'::ffff:','') AS initial_address_,client_name,read_rows,read_bytes,written_rows,written_bytes,total_rows_approx,
         leftPad(formatReadableSize(memory_usage),10) AS memory_usage_,
@@ -78,7 +78,7 @@ function report_clickhouse() {
     ORDER BY query_kind ASC,elapsed DESC;"
 
     local sql_processes_grouped="
-    SELECT metric,formatReadableSize(value),description FROM system.metrics WHERE metric='MemoryTracking';
+    SELECT metric,formatReadableSize(value),description FROM system.metrics WHERE metric IN ('MemoryTracking','MergesMutationsMemoryTracking');
     SELECT
         query_kind,count() AS count,leftPad(formatReadableSize(sum(memory_usage)), 10) AS memory_usage_,
         groupUniqArray(initial_user) AS initial_users,
