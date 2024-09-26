@@ -310,7 +310,7 @@ function on_stoke {
     while [ -n "$char" ]; do read_raw_char 0.01 char; done
 }
 
-function update_size() { LINES=$(tput lines) COLUMNS=$(tput cols); }
+function update_size() { LINES=$(tput lines) COLUMNS=$(tput cols); ((BATCH !=0 )) && LINES=10000; }
 
 function update_status() {
     local now=$(get_time_ms)
@@ -353,11 +353,12 @@ function run() {
             paste -d "$US" $column1 $column2 | align_columns "$US" ' ' "└─┴─┘│┌┬┐"
 
             echo -n "$mutations"
-        ) |& no_color | clear_rest_of_screen | head -n $LINES)
+
+        ) |& no_color | clear_rest_of_screen)
 
         cursor_to 1 1
 
-        echo -n "$content"
+        echo "$content" | head -n $LINES
         status
 
         ((i == BATCH)) && { echo; break; } # Exit early in batch mode
